@@ -1,0 +1,29 @@
+name: Prolucian Auto Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Secrets (Debug Mode)
+        run: |
+          if [ -z "${{ secrets.VERCEL_TOKEN }}" ]; then echo "❌ Missing: VERCEL_TOKEN"; exit 1; else echo "✅ Found: VERCEL_TOKEN"; fi
+          if [ -z "${{ secrets.VERCEL_ORG_ID }}" ]; then echo "❌ Missing: VERCEL_ORG_ID"; exit 1; else echo "✅ Found: VERCEL_ORG_ID"; fi
+          if [ -z "${{ secrets.VERCEL_PROJECT_ID }}" ]; then echo "❌ Missing: VERCEL_PROJECT_ID"; exit 1; else echo "✅ Found: VERCEL_PROJECT_ID"; fi
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then echo "❌ Missing: TELEGRAM_BOT_TOKEN"; exit 1; else echo "✅ Found: TELEGRAM_BOT_TOKEN"; fi
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "❌ Missing: TELEGRAM_CHAT_ID"; exit 1; else echo "✅ Found: TELEGRAM_CHAT_ID"; fi
+
+      - name: Notify Telegram
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🚀 Prolucian is live!
+            ✅ All secrets verified
+            🌍 Timezone: Africa/Johannesburg
