@@ -1,0 +1,591 @@
+name: Prolucian Absolute Everything Giant (Signals + Billing)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "45 22 * * *"   # Asia 00:45 SAST
+    - cron: "45 06 * * *"   # Europe 08:45 SAST
+    - cron: "45 13 * * *"   # US 15:45 SAST
+    - cron: "0 20 * * *"    # Daily 22:00 SAST
+    - cron: "0 20 * * 0"    # Weekly
+    - cron: "0 20 1 * *"    # Monthly
+    - cron: "0 20 1 */3 *"  # Quarterly
+    - cron: "0 20 1 1 *"    # Yearly
+
+permissions:
+  contents: write
+
+jobs:
+  absolute:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Africa/Johannesburg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify core secrets
+        run: |
+          ok=1
+          required=(TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ACCOUNT_BALANCE)
+          for s in "${required[@]}"; do
+            if [ -z "${{ secrets[$s] }}" ]; then
+              echo "❌ Missing required secret: $s"; ok=0
+            else
+              echo "✅ Found: $s"
+            fi
+          done
+          if [ $ok -eq 0 ]; then
+            exit 1
+          fi
+          echo "ℹ️ Optional: VIP_TELEGRAM_CHAT_ID, TRADING_ECON_API_KEY"
+          echo "ℹ️ Billing optional: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, COINBASE_COMMERCE_API_KEY, MAIN_GROUP_ID, VIP_GROUP_ID"
+          echo "ℹ️ Vercel optional: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Create server (billing + bot webhook) files
+        run: |
+          mkdir -p api charts
+          cat > requirements.txt << 'REQ'
+          fastapi==0.111.0
+          uvicorn==0.30.1
+          requests==2.32.3
+          python-dateutil==2.9.0
+          yfinance==0.2.43
+          pandas==2.2.2
+          numpy==1.26.4
+          plotly==5.23.0
+          kaleido==0.2.1
+          ta==0.11.0
+          REQ
+
+          cat > vercel.json << 'VJ'
+          {
+            "version": 2,
+            "functions": {
+              "api/*.py": {
+                "runtime": "python3.11"
+              }
+            },
+            "routes": [
+              { "src": "/telegram", "dest": "/api/telegram.py" },
+              { "src": "/billing/create-checkout", "dest": "/api/create_checkout.py" },
+              { "src": "/billing/stripe-webhook", "dest": "/api/stripe_webhook.py" },
+              { "src": "/billing/create-crypto", "dest": "/api/create_crypto.py" },
+              { "src": "/billing/coinbase-webhook", "dest": "/api/coinbase_webhook.py" }
+            ]
+          }
+          VJ
+
+          # ---- utils shared by serverless functions ----
+          cat > api/_utils.py << 'PY'
+          import os, requests, datetime as dt
+          from dateutil import tz
+          TZ = "Africa/Johannesburg"
+          tz_sa = tz.gettz(TZ)
+
+          BOT = os.getenv("TELEGRAM_BOT_TOKEN","")
+          MAIN_ID = os.getenv("MAIN_GROUP_ID","")
+          VIP_ID  = os.getenv("VIP_GROUP_ID","")
+          TG = f"https://api.telegram.org/bot{BOT}"
+
+          BRAND = "Trademark: Azikiwe Mlamli, Sons and Daughters\nﷲ ﷺ"
+
+          def tg_send(chat_id, text):
+            if not BOT or not chat_id: return
+            try:
+              requests.post(f"{TG}/sendMessage", data={"chat_id":chat_id,"text":text}, timeout=20)
+            except: pass
+
+          def tg_send_invite(chat_id, for_group="main"):
+            # Best practice: pre-create your invite links and store them in secrets
+            # to avoid permission issues. We’ll read MAIN_INVITE_LINK / VIP_INVITE_LINK if present.
+            link = os.getenv("MAIN_INVITE_LINK","") if for_group=="main" else os.getenv("VIP_INVITE_LINK","")
+            if not link:
+              # fallback message
+              tg_send(chat_id, "Admin will DM you your private invite link shortly. ✅")
+            else:
+              tg_send(chat_id, f"Here is your private invite link: {link}")
+
+          def now_sa_str():
+            return dt.datetime.now(tz_sa).strftime("%Y-%m-%d %H:%M")
+          PY
+
+          # ---- Telegram webhook: /start, /subscribe ----
+          cat > api/telegram.py << 'PY'
+          from fastapi import FastAPI, Request
+          from ._utils import tg_send, tg_send_invite, now_sa_str, BRAND
+          import os
+
+          app = FastAPI()
+
+          HOST = os.getenv("VERCEL_PROJECT_PRODUCTION_URL","") or os.getenv("VERCEL_URL","")
+          if HOST and not HOST.startswith("http"):
+            HOST = "https://" + HOST
+
+          @app.get("/")
+          def root():
+            return {"ok": True, "service": "Prolucian Billing & Bot Webhook"}
+
+          @app.post("/")
+          async def webhook(req: Request):
+            data = await req.json()
+            msg = data.get("message") or data.get("edited_message") or {}
+            chat = msg.get("chat",{}); chat_id = str(chat.get("id",""))
+            text = (msg.get("text") or "").strip()
+            user = msg.get("from",{}); uid = str(user.get("id",""))
+
+            if text.startswith("/start"):
+              tg_send(chat_id, f"Welcome to Prolucian! ({now_sa_str()} SAST)\nType /subscribe to get Main or VIP access.\n{BRAND}")
+              return {"ok":True}
+
+            if text.startswith("/subscribe"):
+              # Return two links: Stripe and Crypto (server endpoints create invoices with metadata tid=uid)
+              stripe = f"{HOST}/billing/create-checkout?plan=main&tid={uid}"
+              stripe_vip = f"{HOST}/billing/create-checkout?plan=vip&tid={uid}"
+              crypto = f"{HOST}/billing/create-crypto?plan=main&tid={uid}"
+              crypto_vip = f"{HOST}/billing/create-crypto?plan=vip&tid={uid}"
+              tg_send(chat_id,
+                "Choose your plan:\n\n"
+                f"Main: Stripe {stripe}\n"
+                f"VIP:  Stripe {stripe_vip}\n\n"
+                f"Main: Crypto {crypto}\n"
+                f"VIP:  Crypto {crypto_vip}\n\n"
+                "After payment, you will receive your private invite link automatically. ✅")
+              return {"ok":True}
+
+            # Fallback
+            if text:
+              tg_send(chat_id, "Commands: /start, /subscribe")
+            return {"ok":True}
+          PY
+
+          # ---- Stripe checkout creator ----
+          cat > api/create_checkout.py << 'PY'
+          from fastapi import FastAPI, Request, HTTPException
+          from fastapi.responses import JSONResponse, RedirectResponse
+          import os, requests
+
+          app = FastAPI()
+
+          STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY","")
+          SUCCESS_URL = os.getenv("SUCCESS_URL","https://t.me/uProlucianBot")
+          CANCEL_URL  = os.getenv("CANCEL_URL","https://t.me/uProlucianBot")
+
+          PRICES = {
+            "main_monthly": os.getenv("STRIPE_PRICE_MAIN_MONTHLY",""),  # optional if using pre-made Price IDs
+            "vip_monthly":  os.getenv("STRIPE_PRICE_VIP_MONTHLY",""),
+            "main_yearly":  os.getenv("STRIPE_PRICE_MAIN_YEARLY",""),
+            "vip_yearly":   os.getenv("STRIPE_PRICE_VIP_YEARLY","")
+          }
+
+          # Fallback dynamic amounts (in USD cents) if no Price IDs are configured:
+          DYNAMIC = {
+            "main": 299,  # $2.99
+            "vip":  999,  # $9.99
+            "main_yearly": 3000, # $30
+            "vip_yearly":  9100  # $91
+          }
+
+          def create_checkout_amount(amount_cents, tid, plan):
+            if not STRIPE_KEY: raise HTTPException(400, "Stripe not configured.")
+            url = "https://api.stripe.com/v1/checkout/sessions"
+            data = {
+              "mode": "payment",
+              "success_url": SUCCESS_URL,
+              "cancel_url": CANCEL_URL,
+              "line_items[0][price_data][currency]": "usd",
+              "line_items[0][price_data][product_data][name]": f"Prolucian {plan}",
+              "line_items[0][price_data][unit_amount]": str(amount_cents),
+              "line_items[0][quantity]": "1",
+              "metadata[telegram_id]": tid,
+              "metadata[plan]": plan
+            }
+            r = requests.post(url, data=data, headers={"Authorization": f"Bearer {STRIPE_KEY}"}, timeout=30)
+            if not r.ok: raise HTTPException(400, f"Stripe error: {r.text}")
+            return r.json()["url"]
+
+          @app.get("/")
+          def create(plan: str="main", tid: str=""):
+            if not tid: raise HTTPException(400, "Missing tid")
+            amount = DYNAMIC.get(plan, 299)
+            url = create_checkout_amount(amount, tid, plan)
+            return RedirectResponse(url)
+          PY
+
+          # ---- Stripe webhook: grant/revoke access ----
+          cat > api/stripe_webhook.py << 'PY'
+          from fastapi import FastAPI, Request
+          from ._utils import tg_send, tg_send_invite
+          import os, hmac, hashlib, base64, requests
+
+          app = FastAPI()
+          SECRET = os.getenv("STRIPE_WEBHOOK_SECRET","")
+
+          def verify(req_body: bytes, sig_header: str):
+            # Minimal safe check (Stripe official verification requires their lib; here we soft-accept if secret absent)
+            if not SECRET: return True
+            try:
+              # Stripe sends t=,v1=...; we validate v1 HMAC with signing secret (simplified)
+              parts = dict(kv.split("=",1) for kv in sig_header.split(","))
+              v1 = parts.get("v1","")
+              mac = hmac.new(SECRET.encode(), req_body, hashlib.sha256).hexdigest()
+              return hmac.compare_digest(mac, v1)
+            except:
+              return False
+
+          @app.post("/")
+          async def webhook(request: Request):
+            body = await request.body()
+            sig = request.headers.get("Stripe-Signature","")
+            if not verify(body, sig):
+              return {"ok": False}
+
+            data = (await request.json()).get("data",{}).get("object",{})
+            event = (await request.json()).get("type","")
+            # We set metadata on Checkout Session
+            md = data.get("metadata") or {}
+            tid = str(md.get("telegram_id",""))
+            plan = str(md.get("plan","main"))
+
+            if event in ("checkout.session.completed","payment_intent.succeeded"):
+              if tid:
+                tg_send(tid, "✅ Payment received. Delivering your invite link...")
+                tg_send_invite(tid, "vip" if "vip" in plan else "main")
+            elif event in ("charge.refunded","customer.subscription.deleted","payment_intent.payment_failed"):
+              if tid:
+                tg_send(tid, "⚠️ Payment cancelled/failed. Your access may be revoked.")
+            return {"ok": True}
+          PY
+
+          # ---- Crypto (Coinbase Commerce) checkout ----
+          cat > api/create_crypto.py << 'PY'
+          from fastapi import FastAPI, HTTPException
+          from fastapi.responses import RedirectResponse
+          import os, requests, json
+
+          app = FastAPI()
+          API_KEY = os.getenv("COINBASE_COMMERCE_API_KEY","")
+          SUCCESS_URL = os.getenv("SUCCESS_URL","https://t.me/uProlucianBot")
+          CANCEL_URL  = os.getenv("CANCEL_URL","https://t.me/uProlucianBot")
+
+          PRICES = {"main":2.99,"vip":9.99,"main_yearly":30.0,"vip_yearly":91.0}
+
+          @app.get("/")
+          def create(plan: str="main", tid: str=""):
+            if not API_KEY: raise HTTPException(400, "Coinbase Commerce not configured.")
+            if not tid: raise HTTPException(400,"Missing tid")
+            amount = PRICES.get(plan, 2.99)
+            url = "https://api.commerce.coinbase.com/charges"
+            headers = {"X-CC-Api-Key": API_KEY, "Content-Type": "application/json"}
+            payload = {
+              "name": f"Prolucian {plan}",
+              "description": f"Access for {plan}",
+              "pricing_type": "fixed_price",
+              "local_price": {"amount": str(amount), "currency": "USD"},
+              "metadata": {"telegram_id": tid, "plan": plan},
+              "redirect_url": SUCCESS_URL,
+              "cancel_url": CANCEL_URL
+            }
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            if not r.ok: raise HTTPException(400, f"Crypto gateway error: {r.text}")
+            hosted = r.json()["data"]["hosted_url"]
+            return RedirectResponse(hosted)
+          PY
+
+          # ---- Crypto webhook ----
+          cat > api/coinbase_webhook.py << 'PY'
+          from fastapi import FastAPI, Request
+          from ._utils import tg_send, tg_send_invite
+          import os, hmac, hashlib, json
+
+          app = FastAPI()
+          SHARED = os.getenv("COINBASE_SHARED_SECRET","")  # optional signature shared secret
+
+          def verify(signature: str, payload: bytes):
+            # Minimal verification if you set COINBASE_SHARED_SECRET
+            if not SHARED: return True
+            mac = hmac.new(SHARED.encode(), payload, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(mac, signature or "")
+
+          @app.post("/")
+          async def webhook(request: Request):
+            payload = await request.body()
+            sig = request.headers.get("X-CC-Webhook-Signature","")
+            if not verify(sig, payload):
+              return {"ok": False}
+
+            data = (await request.json()).get("event",{}).get("data",{})
+            md = data.get("metadata") or {}
+            tid = str(md.get("telegram_id",""))
+            plan = str(md.get("plan","main"))
+            event = (await request.json()).get("event",{}).get("type","")
+
+            if event in ("charge:confirmed","charge:resolved"):
+              if tid:
+                tg_send(tid, "✅ Crypto payment confirmed. Delivering invite link...")
+                tg_send_invite(tid, "vip" if "vip" in plan else "main")
+            elif event in ("charge:failed","charge:pending"):
+              if tid:
+                tg_send(tid, "⚠️ Crypto payment pending/failed.")
+            return {"ok": True}
+          PY
+
+      - name: Install trading libs for signals
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy plotly kaleido ta requests python-dateutil
+
+      - name: Run Signals + Summaries + Calendar (and save ledger)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          MAIN_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VIP_CHAT: ${{ secrets.VIP_TELEGRAM_CHAT_ID }}
+          ACCOUNT_BALANCE: ${{ secrets.ACCOUNT_BALANCE }}
+          TRADING_ECON_API_KEY: ${{ secrets.TRADING_ECON_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - << 'PY'
+          import os, io, json, math, datetime as dt
+          from dateutil import tz
+          import requests, numpy as np, pandas as pd, yfinance as yf
+          import plotly.graph_objects as go
+
+          TZ_NAME="Africa/Johannesburg"
+          tz_sa = tz.gettz(TZ_NAME)
+          now_sa = dt.datetime.now(tz_sa)
+
+          BAL = float(os.getenv("ACCOUNT_BALANCE","10000"))
+          BOT = os.getenv("TELEGRAM_BOT_TOKEN")
+          MAIN_CHAT = os.getenv("MAIN_CHAT")
+          VIP_CHAT  = os.getenv("VIP_CHAT")
+          TG = f"https://api.telegram.org/bot{BOT}"
+
+          TE_KEY = os.getenv("TRADING_ECON_API_KEY")
+          TE_URL = "https://api.tradingeconomics.com/calendar"
+
+          MAJORS=["EURUSD=X","GBPUSD=X","USDJPY=X"]
+          MINORS=["EURAUD=X","GBPJPY=X","AUDJPY=X"]
+          COMMS =["GC=F","CL=F","SI=F"]
+          INDICES=["^NDX","^GSPC","^DJI"]
+          CRYPTO=["BTC-USD","ETH-USD","SOL-USD"]
+          MAIN_SYMBOLS=MAJORS+MINORS+COMMS+INDICES+CRYPTO
+          VIP_SYMBOLS=["EURUSD=X","GBPUSD=X","USDJPY=X","GBPJPY=X","XAUUSD=X","GC=F","CL=F","^NDX","BTC-USD","ETH-USD"]
+
+          POS_EMO="✅🔥💡"; MIX_EMO="🤔⚖️🍋"; NEG_EMO="❌⚠️💧"
+          BRAND="Trademark: Azikiwe Mlamli, Sons and Daughters\nﷲ ﷺ"
+          os.makedirs("charts", exist_ok=True)
+
+          def tg_msg(chat_id, text):
+            if not chat_id or not BOT: return
+            try:
+              requests.post(f"{TG}/sendMessage", data={"chat_id":chat_id,"text":text}, timeout=25)
+            except: pass
+
+          def tg_doc(chat_id, path, caption=None):
+            if not chat_id or not os.path.exists(path): return
+            try:
+              with open(path,"rb") as f:
+                files={"document":(os.path.basename(path),f)}
+                data={"chat_id":chat_id}
+                if caption: data["caption"]=caption
+                requests.post(f"{TG}/sendDocument", files=files, data=data, timeout=60)
+            except: pass
+
+          def ema(s, span): return s.ewm(span=span, adjust=False).mean()
+          def near_flat(series, look=50, rel=0.0001):
+            s=series.iloc[-look:]; 
+            if len(s)<look: return False
+            slope = (s.iloc[-1]-s.iloc[0]) / look
+            return abs(slope) < rel * max(1e-9, abs(s.mean()))
+          def near_cross(a,b,tol=0.001): 
+            return abs((a-b)/b)<=tol if b else False
+          def fib_levels(lo,hi):
+            if hi<lo: lo,hi=hi,lo
+            d=hi-lo
+            return {"0.5":hi-0.5*d,"0.786":hi-0.786*d}
+          def momentum_prob_4h(df4):
+            if df4 is None or df4.empty: return 0.5
+            ema20=df4["Close"].ewm(span=20,adjust=False).mean()
+            slope=(ema20.iloc[-1]-ema20.iloc[-5])/5 if len(ema20)>5 else 0
+            vol=df4["Close"].pct_change().rolling(20).std().iloc[-1]
+            if not np.isfinite(vol) or vol==0: return 0.5
+            score=0.5+np.tanh((slope/(vol+1e-9))*3)/2
+            return float(max(0,min(1,score)))
+
+          def risk_lines(balance):
+            tiers=[("Conservative (0.05%)",0.0005),("Mean (5%)",0.05),("Aggressive (15%)",0.15)]
+            out=[]
+            for name,p in tiers:
+              risk=balance*p
+              tib= math.floor(balance/risk) if risk>0 else "∞"
+              out.append(f"• {name}: ${risk:,.2f} risk → trades-until-blow: {tib}")
+            return "\n".join(out)
+
+          def te_calendar():
+            if not TE_KEY: return "TE: not configured."
+            try:
+              utc_now=dt.datetime.utcnow(); utc_later=utc_now+dt.timedelta(days=1)
+              r=requests.get(TE_URL, params={"c":TE_KEY,"importance":"3",
+                                             "d1":utc_now.strftime("%Y-%m-%d"),
+                                             "d2":utc_later.strftime("%Y-%m-%d")}, timeout=30)
+              if not r.ok: return "TE: error."
+              data=r.json() or []
+              out=[]
+              from dateutil import tz
+              tza=tz.gettz("Africa/Johannesburg")
+              for ev in data[:5]:
+                when=ev.get("Date","")
+                try:
+                  import datetime as _dt
+                  t=_dt.datetime.fromisoformat(when.replace("Z","+00:00")).astimezone(tza).strftime("%d %b %H:%M")
+                except: t=when
+                out.append(f"• {t} {ev.get('Country','')} – {ev.get('Event','')} ({ev.get('Category','')})")
+              return "High-impact (24h):\n"+("\n".join(out) if out else "None")
+            except: return "TE: exception."
+
+          def chart(symbol, df, levels, notes):
+            fig=go.Figure(data=[go.Candlestick(
+              x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+              increasing_line_color="green", decreasing_line_color="red", name=symbol)])
+            order=[("SL","purple"),("TP1","black"),("TP2","red"),("TP3","gold"),("TP4","green"),("TP5","darkgreen")]
+            for k,c in order:
+              if levels.get(k) is not None:
+                fig.add_hline(y=levels[k], line_color=c, annotation_text=k, annotation_position="right")
+            for txt,y in notes:
+              fig.add_annotation(text=txt, x=df.index[-20], y=y, showarrow=True, arrowhead=1, bgcolor="rgba(255,255,255,0.2)")
+            fig.update_layout(title=f"{symbol} – Prolucian Signal", template="plotly_dark", xaxis_rangeslider_visible=False, height=720)
+            png=f"charts/{symbol.replace('=','').replace('^','')}.png"
+            html=f"charts/{symbol.replace('=','').replace('^','')}.html"
+            fig.write_image(png); fig.write_html(html, include_plotlyjs="cdn")
+            return png, html
+
+          def chart3d(symbol, df):
+            import numpy as np
+            idx=np.arange(len(df)); price=df["Close"].values; rng=(df["High"]-df["Low"]).values
+            fig=go.Figure(data=[go.Scatter3d(x=idx,y=price,z=rng,mode="lines+markers",name="3D Context")])
+            fig.update_layout(title=f"{symbol} – 3D Context", template="plotly_dark",
+                              scene=dict(xaxis_title="Bars",yaxis_title="Price",zaxis_title="Range"), height=720)
+            html=f"charts/{symbol.replace('=','').replace('^','')}_3d.html"
+            fig.write_html(html, include_plotlyjs="cdn")
+            return html
+
+          def signal(symbol):
+            df=yf.download(symbol, period="10d", interval="15m", progress=False, auto_adjust=True)
+            if df is None or df.empty or len(df)<220: return None
+            df.dropna(inplace=True)
+            df4=yf.download(symbol, period="90d", interval="4h", progress=False, auto_adjust=True)
+            mom=momentum_prob_4h(df4)
+
+            close=df["Close"]; high=df["High"]; low=df["Low"]
+            ema2=ema(close,2); ema5=ema(close,5); ema20=ema(close,20); ema75=ema(close,75); ema200=ema(close,200)
+            p=float(close.iloc[-1]); e2=float(ema2.iloc[-1]); e5=float(ema5.iloc[-1]); e20=float(ema20.iloc[-1]); e75=float(ema75.iloc[-1]); e200=float(ema200.iloc[-1])
+
+            buy_ok = near_flat(ema200) and near_cross(e20,e200) and (e2>e5>e20) and (e200>e20)
+            sell_ok= near_flat(ema200) and near_cross(e20,e200) and (e2<e5<e20)
+
+            swing_hi=float(high.iloc[-30:].max()); swing_lo=float(low.iloc[-30:].min())
+            fibs=fib_levels(swing_lo,swing_hi)
+
+            def r4(x): 
+              try: return f"{float(x):.4f}"
+              except: return str(x)
+
+            if buy_ok:
+              direction="BUY"
+              SL=min(swing_lo, p*0.999)
+              TP1,TP2,TP3=e75, fibs["0.5"], fibs["0.786"]
+              rr3=(TP3-p)/max(1e-9, p-SL)
+              TP4=p+(p-SL)*4.5 if mom>=0.80 else None
+              TP5=p+(p-SL)*7.0 if mom>=0.80 else None
+              notes=[("BOS", p*1.001),("CHoCH", p*1.002),("Order Block", p*0.999)]
+            elif sell_ok:
+              direction="SELL"
+              SL=max(swing_hi, p*1.001)
+              TP1,TP2,TP3=e75, fibs["0.5"], fibs["0.786"]
+              rr3=(p-TP3)/max(1e-9, SL-p)
+              TP4=p-(SL-p)*4.5 if mom>=0.80 else None
+              TP5=p-(SL-p)*7.0 if mom>=0.80 else None
+              notes=[("BOS", p*0.999),("CHoCH", p*0.998),("Order Block", p*1.001)]
+            else:
+              return None
+
+            if rr3<9.0: return None
+
+            levels={"SL":SL,"TP1":TP1,"TP2":TP2,"TP3":TP3,"TP4":TP4,"TP5":TP5}
+            png,html=chart(symbol, df.tail(220), levels, notes); html3d=chart3d(symbol, df.tail(400))
+
+            msg=(f"🧭 {now_sa.strftime('%a %d %b %H:%M')} SAST\n"
+                 f"📈 {symbol}\n📣 {direction}\n💼 Balance: ${BAL:,.2f}\n\n"
+                 f"🛡️ Risk tiers:\n{risk_lines(BAL)}\n\n"
+                 f"🎯 Targets:\n• TP1 (EMA75): {r4(TP1)}\n• TP2 (Fib S/R): {r4(TP2)}\n"
+                 f"• TP3 (0.786): {r4(TP3)} — R:R ≥ 1:9 ✅\n"
+                 f"• TP4 (1:4.5): {'enabled' if levels['TP4'] else '—'} {r4(levels['TP4']) if levels['TP4'] else ''}\n"
+                 f"• TP5 (1:7): {'enabled' if levels['TP5'] else '—'} {r4(levels['TP5']) if levels['TP5'] else ''}\n"
+                 f"😀 Reactions: ✅🔥💡 | 🤔⚖️🍋 | ❌⚠️💧\n\nTrademark: Azikiwe Mlamli, Sons and Daughters\nﷲ ﷺ")
+            return {"symbol":symbol,"png":png,"html":html,"html3d":html3d,"msg":msg}
+
+          tg_msg(MAIN_CHAT, f"🚀 Prolucian starting – {now_sa.strftime('%Y-%m-%d %H:%M')} SAST\nTrademark: Azikiwe Mlamli, Sons and Daughters\nﷲ ﷺ")
+
+          signals=[]
+          for sym in ["EURUSD=X","GBPUSD=X","USDJPY=X","EURAUD=X","GBPJPY=X","AUDJPY=X","GC=F","CL=F","SI=F","^NDX","^GSPC","^DJI","BTC-USD","ETH-USD","SOL-USD"]:
+            try:
+              s=signal(sym)
+              if s: signals.append(s)
+            except Exception as e:
+              print("Err",sym,e)
+
+          if signals:
+            for s in signals:
+              tg_msg(MAIN_CHAT, s["msg"])
+              tg_doc(MAIN_CHAT, s["png"], f"{s['symbol']} – PNG")
+              tg_doc(MAIN_CHAT, s["html"], f"{s['symbol']} – Interactive")
+              tg_doc(MAIN_CHAT, s["html3d"], f"{s['symbol']} – 3D")
+          else:
+            tg_msg(MAIN_CHAT,"ℹ️ No qualified MAIN signals now (confluence or 1:9 not met).")
+
+          def cal():
+            try: return te_calendar()
+            except: return "Calendar unavailable."
+          tg_msg(MAIN_CHAT, "🗓️ Calendar\n"+cal())
+
+          # simple ledger
+          path="charts/ledger.json"
+          import json, os
+          if os.path.exists(path):
+            with open(path,"r") as f: ledger=json.load(f)
+          else:
+            ledger={"runs":0,"signals":0,"since": now_sa.isoformat()}
+          ledger["runs"]+=1; ledger["signals"]+=len(signals)
+          with open(path,"w") as f: json.dump(ledger,f,indent=2)
+
+          os.system('git config user.name "github-actions"')
+          os.system('git config user.email "github-actions@users.noreply.github.com"')
+          os.system('git add charts/ledger.json')
+          os.system('git commit -m "[skip ci] Update ledger.json" || true')
+          os.system('git push || true')
+
+          tg_msg(MAIN_CHAT,"✅ Prolucian finished.")
+          PY
+
+      - name: Optional – Deploy to Vercel (billing endpoints)
+        if: ${{ secrets.VERCEL_TOKEN != '' && secrets.VERCEL_ORG_ID != '' && secrets.VERCEL_PROJECT_ID != '' }}
+        run: |
+          npm i -g vercel@32
+          vercel pull --yes --token ${{ secrets.VERCEL_TOKEN }} --scope ${{ secrets.VERCEL_ORG_ID }}
+          vercel deploy --prebuilt --token ${{ secrets.VERCEL_TOKEN }} --scope ${{ secrets.VERCEL_ORG_ID }} --project ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel deploy --prebuilt --prod --token ${{ secrets.VERCEL_TOKEN }} --scope ${{ secrets.VERCEL_ORG_ID }} --project ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Failure Alert
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=❌ Prolucian workflow failed. Check Actions logs."
