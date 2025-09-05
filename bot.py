@@ -224,11 +224,7 @@ async def report_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = summarize_report(df, period.capitalize())
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# =================== Billing (Stripe optional) ===================
-STRIPE_SECRET   = os.getenv("STRIPE_SECRET","")
-PRICE_MAIN_ID   = os.getenv("PRICE_MAIN_ID","")   # e.g., price_xxx for $2.99/mo or $30/yr
-PRICE_VIP_ID    = os.getenv("PRICE_VIP_ID","")    # e.g., price_yyy for $9.99/mo or $91/yr
-SUCCESS_URL     = os.getenv("SUCCESS_URL","https://t.me/")  # fallback
+# =================== Billing (Manual EFT / Admin Controlled) ===================
 
 def init_billing_tables():
     with db() as conn, conn.cursor() as cur:
@@ -273,68 +269,26 @@ def is_active(user_id: int, tier: str) -> bool:
         cur.execute("SELECT 1 FROM subscriptions WHERE user_id=%s AND tier=%s AND expires_at > NOW();", (user_id,tier))
         return cur.fetchone() is not None
 
+# Subscription command (manual payment flow)
 async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Creates a Stripe Checkout link if STRIPE_SECRET present; else instructions."""
     upsert_user(update.effective_user)
     plan = (ctx.args[0].lower() if ctx.args else "main")  # 'main' or 'vip'
     period = (ctx.args[1].lower() if len(ctx.args)>1 else "monthly")  # 'monthly' or 'yearly'
     if plan not in ("main","vip"): plan="main"
     if period not in ("monthly","yearly"): period="monthly"
 
-    if not STRIPE_SECRET:
-        await update.message.reply_text(
-            "Payments API not configured.\nAsk admin to add you manually:\n"
-            "• /grantvip <user_id> <days>\n• /grantmain <user_id> <days>\n"
-            "Or set STRIPE_SECRET, PRICE_MAIN_ID, PRICE_VIP_ID in .env.")
-        return
-
-    import stripe
-    stripe.api_key = STRIPE_SECRET
-    price = PRICE_MAIN_ID if plan=="main" else PRICE_VIP_ID
-    if not price:
-        await update.message.reply_text("Stripe price ID missing in .env.")
-        return
-
-    # For monthly vs yearly, you should create two separate price IDs in Stripe and switch here if needed.
-    # For simplicity we reuse PRICE_*_ID regardless of period (configure in Stripe per usage).
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price, "quantity": 1}],
-        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=SUCCESS_URL,
-        metadata={"tg_user_id": str(update.effective_user.id), "plan": plan, "period": period}
+    # Your manual instructions
+    msg = (
+        f"💳 To subscribe to <b>{plan.upper()}</b> ({period}):\n\n"
+        f"➡️ Send payment to:\n"
+        f"Bank: Nedbank\n"
+        f"Account: 1265020183\n"
+        f"Name: Azikiwe Mlamli\n"
+        f"Reference: {update.effective_user.id}\n\n"
+        "💡 After payment, send proof to admin.\n"
+        "Admin will confirm and activate your subscription."
     )
-    await update.message.reply_text(
-        f"🔐 Pay for <b>{plan.upper()}</b> ({period})\n"
-        f"Checkout: {session.url}\n\nAfter payment, send:\n/redeem {session.id}",
-        parse_mode=ParseMode.HTML
-    )
-
-async def redeem_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User pastes session_id; we verify payment and activate sub."""
-    if not STRIPE_SECRET:
-        await update.message.reply_text("Stripe not configured.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /redeem <session_id>")
-        return
-    session_id = ctx.args[0]
-    import stripe
-    stripe.api_key = STRIPE_SECRET
-    try:
-        sess = stripe.checkout.Session.retrieve(session_id, expand=["subscription","customer"])
-        if sess.payment_status != "paid":
-            await update.message.reply_text("Payment not completed yet.")
-            return
-        plan = sess.metadata.get("plan","main")
-        period = sess.metadata.get("period","monthly")
-        days = 30 if period=="monthly" else 365
-        user_id = int(sess.metadata.get("tg_user_id") or update.effective_user.id)
-        upsert_user(update.effective_user)
-        set_subscription(user_id, plan, days)
-        await update.message.reply_text(f"✅ {plan.upper()} activated for {days} days.")
-    except Exception as e:
-        await update.message.reply_text(f"Redeem error: {e}")
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -347,8 +301,8 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"VIP:  {'ACTIVE' if active_vip else '—'}"
     )
 
-# Admin helpers (manually grant)
-ADMIN_IDS = set([ ])  # optionally add your Telegram user id here for admin commands
+# Admin helpers
+ADMIN_IDS = set([ ])  # Add your own Telegram ID here
 
 async def grantvip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
